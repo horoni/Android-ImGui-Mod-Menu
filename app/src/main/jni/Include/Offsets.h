@@ -1,3 +1,5 @@
+#ifndef HORONI_OFFSETS_H
+#define HORONI_OFFSETS_H
 
 //! BNM::IL2CPP::Il2CppObject if class inherits System.Object or nothing
 //! BNM::UnityEngine::Object if class inherits UnityEngine.ScriptableObject
@@ -16,3 +18,5 @@ namespace ofst {
     
     void Init();
 }
+
+#endif // HORONI_OFFSETS_H

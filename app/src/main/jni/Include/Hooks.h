@@ -1,6 +1,6 @@
-#ifndef LSC0X_HOOKS_H
-#define LSC0X_HOOKS_H
+#ifndef HORONI_HOOKS_H
+#define HORONI_HOOKS_H
 
 void Setup_Hooks();
 
-#endif // LSC0X_HOOKS_H
+#endif // HORONI_HOOKS_H

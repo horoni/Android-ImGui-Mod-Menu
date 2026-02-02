@@ -1,4 +1,5 @@
-#pragma once
+#ifndef HORONI_MENU_H
+#define HORONI_MENU_H
 
 #define SCREEN_WIDTH 2400
 #define SCREEN_HEIGHT 1080
@@ -17,3 +18,5 @@ namespace Menu {
     inline bool isInitialized = false;
     inline bool bShowMenu = true;
 }
+
+#endif // HORONI_MENU_H

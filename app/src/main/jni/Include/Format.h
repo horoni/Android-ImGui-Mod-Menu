@@ -1,5 +1,5 @@
-#ifndef LSC0X_FORMAT_H
-#define LSC0X_FORMAT_H
+#ifndef HORONI_FORMAT_H
+#define HORONI_FORMAT_H
 
 #include <string>
 
@@ -12,4 +12,4 @@ std::string capital = "London";
 std::cout << format("%s is a capital of %s", capital.c_str(), country.c_str()) << std::endl;
 */
 
-#endif // LSC0X_FORMAT_H
+#endif // HORONI_FORMAT_H

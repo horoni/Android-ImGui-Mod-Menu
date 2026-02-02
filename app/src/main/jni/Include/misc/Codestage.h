@@ -5,6 +5,9 @@
 //
 //
 
+#ifndef HORONI_CODESTAGE_H
+#define HORONI_CODESTAGE_H
+
 union intfloat {
     int32_t i;
     float f;
@@ -161,3 +164,5 @@ struct ObscuredString {
         key = key->Create(cryptedStr);
     }
 };
+
+#endif // HORONI_CODESTAGE_H
