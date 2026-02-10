@@ -38,6 +38,7 @@ static ElfScanner get_elf(const char *name) {
 
 HOOKINPUT(void, Input, void *thiz, void *ex_ab, void *ex_ac) {
     origInput(thiz, ex_ab, ex_ac);
+    if (!ImGui::GetCurrentContext()) return;
     ImGui_ImplAndroid_HandleInputEvent((AInputEvent *)thiz);
     return;
 }
