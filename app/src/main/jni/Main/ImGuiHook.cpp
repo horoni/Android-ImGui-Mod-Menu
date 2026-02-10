@@ -4,6 +4,7 @@
 #include <GLES2/gl2.h>
 #include <asm-generic/mman.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include <ImGui/imgui.h>
 #include <ImGui/backends/imgui_impl_opengl3.h>
@@ -16,9 +17,9 @@
 #include <Logger.h>
 
 #include <KittyMemory/KittyInclude.hpp>
+#include "xdl.h"
 
 #include <Menu.h>
-#include <unistd.h>
 
 #if defined(INPUT_SDL) || defined(INPUT_UNITY)
 static ElfScanner get_elf(const char *name) {
@@ -42,11 +43,50 @@ HOOKINPUT(void, Input, void *thiz, void *ex_ab, void *ex_ac) {
     ImGui_ImplAndroid_HandleInputEvent((AInputEvent *)thiz);
     return;
 }
-static void input_hook() {
-    void *sym_input = DobbySymbolResolver(OBFUSCATE("/system/lib/libinput.so"), OBFUSCATE("_ZN7android13InputConsumer21initializeMotionEventEPNS_11MotionEventEPKNS_12InputMessageE"));
-    if (sym_input != nullptr) {
-        DobbyHook((void *) sym_input, (void *) myInput, (void **) &origInput);
+
+static int32_t (*origInput2)(void* consumer, void* factory, bool isRaw, long sequenceId,
+                              uint32_t* outPolicyFlags, void** outEventPtr);
+int32_t myInput2(void* consumer, void* factory, bool isRaw, long sequenceId,
+                  uint32_t* outPolicyFlags, void** outEventPtr) {
+    int32_t result = origInput2(consumer, factory, isRaw, sequenceId, outPolicyFlags, outEventPtr);
+    if (!ImGui::GetCurrentContext()) return result;
+
+    if (outEventPtr && *outEventPtr) {
+        AInputEvent* event = (AInputEvent*)*outEventPtr;
+        ImGui_ImplAndroid_HandleInputEvent(event);
     }
+
+    return result;
+}
+
+static void input_hook() {
+    void* hndl = xdl_open("libinput.so", XDL_TRY_FORCE_LOAD);
+    if (!hndl) {
+        LOGE("INPUT: UNIVERSAL: Failed to open libinput.so");
+        return;
+    }
+
+    void *sym_input = xdl_sym(hndl, "_ZN7android13InputConsumer21initializeMotionEventEPNS_11MotionEventEPKNS_12InputMessageE", nullptr);
+    if (sym_input) {
+        if (DobbyHook(sym_input, (void*)myInput, (void**)&origInput) != 0) {
+            LOGE("failed to hook <A14 input");
+        } else {
+            LOGI("Hooked <A14 input");
+            return;
+        }
+    }
+
+    // >A15 64-bit symbol
+    sym_input = xdl_sym(hndl, "_ZN7android13InputConsumer7consumeEPNS_26InputEventFactoryInterfaceEblPjPPNS_10InputEventE", nullptr);
+    if (sym_input) {
+        if (DobbyHook(sym_input, (void*)myInput2, (void**)&origInput2) != 0) {
+            LOGE("failed to hook >A15 input");
+        } else {
+            LOGI("Hooked >A15 input");
+            return;
+        }
+    }
+
 }
 #elif defined(INPUT_UNITY)
 #  include <inputs/touch_input_unity.h>
