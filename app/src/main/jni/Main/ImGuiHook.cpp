@@ -112,23 +112,15 @@ static void hook_input() {
 }
 
 void initMenuHooks() {
-    #if defined(RENDER_VULKAN)
-    const char* targetLib = OBFUSCATE("libvulkan.so");
-    #else
-    const char* targetLib = OBFUSCATE("libEGL.so");
-    #endif
+    #if defined(RENDER_EGL)
+    #define targetLib OBFUSCATE("libEGL.so")
 
-    do {
-      usleep(100000);
+    do { // This loop May be root of some problems
+      usleep(100000); // sleep for 100ms
     } while (!isLibraryLoaded(targetLib));
     sleep(1);
 
-/*
-    do { // This loop May be root of some problems
-        sleep(1);
-    } while (!isLibraryLoaded(targetLib));
-*/
-
+    #endif
     hook_render();
     hook_input();
 
