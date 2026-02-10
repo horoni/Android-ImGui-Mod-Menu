@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.8...3.26)
 project(ImGui_Cheat)
+# Shared library name
+set(TARGET MCL)
 
 # For libmain.so
 find_package(JNI REQUIRED)
@@ -41,7 +43,7 @@ set(DOBBY_LIB ${CMAKE_SOURCE_DIR}/third_party/Dobby/${ANDROID_ABI}/libdobby.a)
 
 # Source files
 add_library(
-    MCL
+    ${TARGET}
     SHARED
     ${MAIN_SRC}
     ${MISC_SRC}
@@ -50,11 +52,31 @@ add_library(
     ${KITTYMEMORY_SRC}
 )
 
+target_compile_options(${TARGET} PRIVATE
+    -Wall -Wextra
+    -Oz -ffunction-sections -fdata-sections -flto
+    -fno-rtti -fvisibility=hidden -fvisibility-inlines-hidden -fno-ident -fno-strict-aliasing
+    -fno-unwind-tables -fno-asynchronous-unwind-tables
+)
+target_link_options(${TARGET} PRIVATE
+    -Wl,-z,max-page-size=16384
+    -s -Oz -Wl,--exclude-libs,ALL -Wl,--gc-sections -Wl,--as-needed -Wl,--icf=all
+    -Wl,--strip-all -Wl,--hash-style=sysv -Wl,--build-id=none
+    #-Wl,-plugin-opt,-thinlto-index-only
+    -Wl,--relax -Wl,--no-rosegment -Wl,--enable-new-dtags
+)
+add_compile_options(-fmacro-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=. -ffile-prefix-map=${CMAKE_SOURCE_DIR}=.)
+
+find_program(LLVM_OBJCOPY_PATH NAMES "llvm-objcopy" PATHS ${ANDROID_NDK}/toolchains/llvm/prebuilt/*/bin NO_DEFAULT_PATH)
+if(LLVM_OBJCOPY_PATH)
+    add_custom_command(TARGET ${TARGET} POST_BUILD COMMAND ${LLVM_OBJCOPY_PATH} --remove-section=.note.android.ident --remove-section=.comment --remove-section=.ARM.attributes $<TARGET_FILE:${TARGET}>)
+endif()
+
 # RENDER_EGL or RENDER_JAVA_EGL or RENDER_VULKAN
-target_compile_definitions(MCL PRIVATE RENDER_EGL)
+target_compile_definitions(${TARGET} PRIVATE RENDER_EGL)
 
 # INPUT_UNIVERSAL or INPUT_UNITY or INPUT_SDL
-target_compile_definitions(MCL PRIVATE INPUT_UNIVERSAL)
+target_compile_definitions(${TARGET} PRIVATE INPUT_UNIVERSAL)
 
 target_include_directories(
     BNM
@@ -69,7 +91,7 @@ include_directories(
 )
 
 target_include_directories(
-    MCL
+    ${TARGET}
     PUBLIC
     ${BNM_INCLUDE_DIRECTORIES}
     Include/
@@ -77,7 +99,7 @@ target_include_directories(
 )
 
 target_link_libraries(
-    MCL
+    ${TARGET}
     PUBLIC
     BNM
     ${DOBBY_LIB}
