@@ -29,8 +29,7 @@ int  load_and_remap(JavaVM *vm, void *reserved) {
         fread(&config, sizeof(char), 1, config_f);
     } else {
         LOGW("No conf: using default config and saving");
-        config = config_enum::Load_From_Data |
-                config_enum::Remap |
+        config = config_enum::Remap |
                 config_enum::Call_JNI;
         config_f = fopen(config_path.c_str(), "w+b");
         fwrite(&config, sizeof(char), 1, config_f);
