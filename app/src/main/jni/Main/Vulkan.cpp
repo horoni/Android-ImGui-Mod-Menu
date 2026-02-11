@@ -1,571 +1,494 @@
 #include "Vulkan.h"
+#include "Menu.h"
 
-#include <Dobby/dobby.h>
+#include <android/log.h>
+#include <jni.h>
 
+#include <dlfcn.h>
+#include <pthread.h>
+#include <unistd.h>
+
+#include <mutex>
 #include <vector>
 
 #include <vulkan/vulkan.h>
-#include <ImGui/backends/imgui_impl_android.h>
-#include <ImGui/backends/imgui_impl_vulkan.h>
+#include <vulkan/vulkan_android.h>
+#include <vulkan/vulkan_core.h>
 
-#include <Obfuscate.h>
-#include <Logger.h>
+#include "ImGui/imgui.h"
+#include "ImGui/backends/imgui_impl_android.h"
+#include "ImGui/backends/imgui_impl_vulkan.h"
+#include "fonts/Roboto-Regular.h"
 
-#include <Menu.h>
+#include "dobby.h"
+#include "xdl.h"
 
-#define LOG(...) LOGD(__VA_ARGS__)
+#define DEBUG_MENU 0
+#define DEBUG_LOG 0
+#define DEBUG_LOG_HOOK 0
+#define DEBUG_LOG_ERR 1
+#define DEBUG_LOG_CALL 0
 
-#define RTL_NUMBER_OF(A) (sizeof(A)/sizeof((A)[0]))
+#define LOG_TAG "ImGuiVulkanHook"
 
-static VkAllocationCallbacks* g_Allocator = NULL;
-static VkInstance g_Instance = VK_NULL_HANDLE;
-static VkPhysicalDevice g_PhysicalDevice = VK_NULL_HANDLE;
-static VkDevice g_FakeDevice = VK_NULL_HANDLE, g_Device = VK_NULL_HANDLE;
+#if DEBUG_LOG
+#  define LOGD(...)  __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#else
+#  define LOGD(...)
+#endif
+#if DEBUG_LOG_HOOK
+#  define LOG_HOOK(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#else
+#  define LOG_HOOK(...)
+#endif
+#if DEBUG_LOG_ERR
+#  define LOGE(...)  __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+#else 
+#  define LOGE(...)
+#endif
+#if DEBUG_LOG_CALL
+#  define LOG_CALL(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "[Called]: "#__VA_ARGS__)
+#else
+#  define LOG_CALL(...)
+#endif
 
-static uint32_t g_QueueFamily = (uint32_t)-1;
-static std::vector<VkQueueFamilyProperties> g_QueueFamilies;
 
-static VkPipelineCache g_PipelineCache = VK_NULL_HANDLE;
-static VkDescriptorPool g_DescriptorPool = VK_NULL_HANDLE;
-static uint32_t g_MinImageCount = 2;
-static VkRenderPass g_RenderPass = VK_NULL_HANDLE;
-static ImGui_ImplVulkanH_Frame g_Frames[8] = { };
-static ImGui_ImplVulkanH_FrameSemaphores g_FrameSemaphores[8] = { };
+/* --- Global vars --- */
+VkInstance g_Instance = VK_NULL_HANDLE;
+VkPhysicalDevice g_PhysicalDevice = VK_NULL_HANDLE;
+VkDevice g_Device = VK_NULL_HANDLE;
+VkQueue g_Queue = VK_NULL_HANDLE;
+VkDescriptorPool g_DescriptorPool = VK_NULL_HANDLE;
+VkCommandPool g_CommandPool = VK_NULL_HANDLE;
+VkRenderPass g_RenderPass = VK_NULL_HANDLE;
+VkExtent2D g_ScreenExtent = {0, 0};
+VkFormat g_SurfaceFormat = VK_FORMAT_B8G8R8A8_UNORM;
 
-static VkExtent2D g_ImageExtent = { };
+std::vector<VkFramebuffer> g_Framebuffers;
 
-static void CleanupDeviceVulkan( );
-static void CleanupRenderTarget( );
-static void RenderImGui_Vulkan(VkQueue queue, const VkPresentInfoKHR* pPresentInfo);
-static bool DoesQueueSupportGraphic(VkQueue queue, VkQueue* pGraphicQueue);
+/* Sync */
+std::mutex g_StateMutex;
+bool g_ImGuiNewFrame = false;
+uint32_t g_ImageIndex = 0;
+uint32_t g_MinImageCount = 2;
 
+/* --- original functions --- */
+PFN_vkCreateInstance vkCreateInstanceOrigin = nullptr;
+PFN_vkCreateDevice vkCreateDeviceOrigin = nullptr;
+PFN_vkCreateRenderPass2KHR vkCreateRenderPass2KHROrigin = nullptr;
+PFN_vkCreateFramebuffer vkCreateFramebufferOrigin = nullptr;
+PFN_vkDestroyFramebuffer vkDestroyFramebufferOrigin = nullptr;
+PFN_vkQueueSubmit vkQueueSubmitOrigin = nullptr;
+PFN_vkAcquireNextImageKHR vkAcquireNextImageKHROrigin = nullptr;
 
-static bool CreateDeviceVK( ) {
-    // Create Vulkan Instance
-    {
-        VkInstanceCreateInfo create_info = { };
-        constexpr const char* instance_extension = "VK_KHR_surface";
+PFN_vkVoidFunction (*vkGetDeviceProcAddrOrigin)(VkDevice device, const char* pName) = nullptr;
+PFN_vkVoidFunction (*vkGetInstanceProcAddrOrigin)(VkInstance inst, const char* pName) = nullptr;
 
-        create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-        create_info.enabledExtensionCount = 1;
-        create_info.ppEnabledExtensionNames = &instance_extension;
+/* --- flags --- */
+bool g_ImGuiInitialized = false;
+bool g_InitInProgress = false;
+static bool g_InSubmit = false;
+#if DEBUG_LOG
+static int g_FrameCounter = 0;
+#endif
 
-        // Create Vulkan Instance without any debug feature
-        vkCreateInstance(&create_info, g_Allocator, &g_Instance);
-        LOG("[+] Vulkan: g_Instance: 0x%p\n", g_Instance);
+struct RenderContext {
+    VkCommandBuffer commandBuffer;
+    VkFence fence;
+};
+static RenderContext g_RenderContexts[3];
+static uint32_t g_CurrentContextIndex = 0;
+
+/* --- helper functions --- */
+uint32_t findGraphicsQueueFamily() {
+    uint32_t count = 0;
+    PFN_vkGetPhysicalDeviceQueueFamilyProperties fn;
+    fn = (PFN_vkGetPhysicalDeviceQueueFamilyProperties)
+        vkGetInstanceProcAddrOrigin(g_Instance, "vkGetPhysicalDeviceQueueFamilyProperties");
+    fn(g_PhysicalDevice, &count, nullptr);
+    std::vector<VkQueueFamilyProperties> families(count);
+    fn(g_PhysicalDevice, &count, families.data());
+    for (uint32_t i = 0; i < count; i++) {
+        if (families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) return i;
     }
+    return 0;
+}
 
-    // Select GPU
-    {
-        uint32_t gpu_count;
-        vkEnumeratePhysicalDevices(g_Instance, &gpu_count, NULL);
-        IM_ASSERT(gpu_count > 0);
+VkCommandBuffer createCommandBuffer() {
+    VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandPool = g_CommandPool;
+    allocInfo.commandBufferCount = 1;
+    VkCommandBuffer cmd;
+    vkAllocateCommandBuffers(g_Device, &allocInfo, &cmd);
+    return cmd;
+}
 
-        VkPhysicalDevice* gpus = new VkPhysicalDevice[sizeof(VkPhysicalDevice) * gpu_count];
-        vkEnumeratePhysicalDevices(g_Instance, &gpu_count, gpus);
-
-        // If a number >1 of GPUs got reported, find discrete GPU if present, or use first one available. This covers
-        // most common cases (multi-gpu/integrated+dedicated graphics). Handling more complicated setups (multiple
-        // dedicated GPUs) is out of scope of this sample.
-        int use_gpu = 0;
-        for (int i = 0; i < (int)gpu_count; ++i) {
-            VkPhysicalDeviceProperties properties;
-            vkGetPhysicalDeviceProperties(gpus[i], &properties);
-            if (properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
-                use_gpu = i;
-                break;
-            }
-        }
-
-        g_PhysicalDevice = gpus[use_gpu];
-        LOG("[+] Vulkan: g_PhysicalDevice: 0x%p\n", g_PhysicalDevice);
-
-        delete[] gpus;
+void initRenderContexts() {
+    for (int i = 0; i < 3; i++) {
+        g_RenderContexts[i].commandBuffer = createCommandBuffer();
+        VkFenceCreateInfo fenceInfo = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, nullptr, VK_FENCE_CREATE_SIGNALED_BIT};
+        vkCreateFence(g_Device, &fenceInfo, nullptr, &g_RenderContexts[i].fence);
     }
+}
 
-    // Select graphics queue family
-    {
-        uint32_t count;
-        vkGetPhysicalDeviceQueueFamilyProperties(g_PhysicalDevice, &count, NULL);
-        g_QueueFamilies.resize(count);
-        vkGetPhysicalDeviceQueueFamilyProperties(g_PhysicalDevice, &count, g_QueueFamilies.data( ));
-        for (uint32_t i = 0; i < count; ++i) {
-            if (g_QueueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
-                g_QueueFamily = i;
-                break;
-            }
-        }
-        IM_ASSERT(g_QueueFamily != (uint32_t)-1);
+bool createDescriptorPool() {
+    VkDescriptorPoolSize pool_sizes[] = {
+        { VK_DESCRIPTOR_TYPE_SAMPLER, 100 },
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 100 },
+        { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 100 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 100 },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 100 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 100 },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 100 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 100 },
+        { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 100 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 100 },
+        { VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 100 }
+    };
+    VkDescriptorPoolCreateInfo pool_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    pool_info.maxSets = 1000;
+    pool_info.poolSizeCount = (uint32_t)IM_ARRAYSIZE(pool_sizes);
+    pool_info.pPoolSizes = pool_sizes;
+    return vkCreateDescriptorPool(g_Device, &pool_info, nullptr, &g_DescriptorPool) == VK_SUCCESS;
+}
 
-        LOG("[+] Vulkan: g_QueueFamily: %u\n", g_QueueFamily);
-    }
-
-    // Create Logical Device (with 1 queue)
-    {
-        constexpr const char* device_extension = "VK_KHR_swapchain";
-        constexpr const float queue_priority = 1.0f;
-
-        VkDeviceQueueCreateInfo queue_info = { };
-        queue_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-        queue_info.queueFamilyIndex = g_QueueFamily;
-        queue_info.queueCount = 1;
-        queue_info.pQueuePriorities = &queue_priority;
-
-        VkDeviceCreateInfo create_info = { };
-        create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-        create_info.queueCreateInfoCount = 1;
-        create_info.pQueueCreateInfos = &queue_info;
-        create_info.enabledExtensionCount = 1;
-        create_info.ppEnabledExtensionNames = &device_extension;
-
-        vkCreateDevice(g_PhysicalDevice, &create_info, g_Allocator, &g_FakeDevice);
-
-        LOG("[+] Vulkan: g_FakeDevice: 0x%p\n", g_FakeDevice);
-    }
-
+bool uploadFonts() {
+    VkCommandBuffer cmd = createCommandBuffer();
+    VkCommandBufferBeginInfo begin = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr};
+    vkBeginCommandBuffer(cmd, &begin);
+    ImGui_ImplVulkan_CreateFontsTexture();
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &cmd, 0, nullptr};
+    vkQueueSubmit(g_Queue, 1, &submit, VK_NULL_HANDLE);
+    vkQueueWaitIdle(g_Queue);
+    vkFreeCommandBuffers(g_Device, g_CommandPool, 1, &cmd);
     return true;
 }
 
-static void CreateRenderTarget(VkDevice device, VkSwapchainKHR swapchain) {
-    uint32_t uImageCount;
-    vkGetSwapchainImagesKHR(device, swapchain, &uImageCount, NULL);
+bool initializeImGui() {
+    if (g_Instance == VK_NULL_HANDLE || g_Device == VK_NULL_HANDLE) return false;
+    if (g_Framebuffers.size() < g_MinImageCount) return false;
 
-    VkImage backbuffers[8] = { };
-    vkGetSwapchainImagesKHR(device, swapchain, &uImageCount, backbuffers);
+    LOGD("INIT: Starting ImGui Init. Screen: %dx%d, FBs: %zu", g_ScreenExtent.width, g_ScreenExtent.height, g_Framebuffers.size());
 
-    for (uint32_t i = 0; i < uImageCount; ++i) {
-        g_Frames[i].Backbuffer = backbuffers[i];
-
-        ImGui_ImplVulkanH_Frame* fd = &g_Frames[i];
-        ImGui_ImplVulkanH_FrameSemaphores* fsd = &g_FrameSemaphores[i];
-        {
-            VkCommandPoolCreateInfo info = { };
-            info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-            info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-            info.queueFamilyIndex = g_QueueFamily;
-
-            vkCreateCommandPool(device, &info, g_Allocator, &fd->CommandPool);
-        }
-        {
-            VkCommandBufferAllocateInfo info = { };
-            info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-            info.commandPool = fd->CommandPool;
-            info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            info.commandBufferCount = 1;
-
-            vkAllocateCommandBuffers(device, &info, &fd->CommandBuffer);
-        }
-        {
-            VkFenceCreateInfo info = { };
-            info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-            info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-            vkCreateFence(device, &info, g_Allocator, &fd->Fence);
-        }
-        {
-            VkSemaphoreCreateInfo info = { };
-            info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-            vkCreateSemaphore(device, &info, g_Allocator, &fsd->ImageAcquiredSemaphore);
-            vkCreateSemaphore(device, &info, g_Allocator, &fsd->RenderCompleteSemaphore);
-        }
+    if (!createDescriptorPool()) return false;
+    if (g_RenderPass == VK_NULL_HANDLE) {
+      LOGE("INIT: No game render pass captured!");
+      return false;
     }
 
-    // Create the Render Pass
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.DisplaySize = ImVec2((float)g_ScreenExtent.width, (float)g_ScreenExtent.height);
+
+    // Font
+    /*
+    int systemScale = (1.0 / g_ScreenWidth) * g_ScreenWidth;
+    ImFontConfig font_cfg;
+    font_cfg.SizePixels = systemScale * 22.0f;
+    io.Fonts->AddFontFromMemoryTTF(Roboto_Regular, systemScale * 30.0, 40.0f, NULL, io.Fonts->GetGlyphRangesCyrillic());
+    ImGui::GetStyle().ScaleAllSizes(2);
+    */
+    io.FontGlobalScale = 2.0f;
+
+    ImGui::StyleColorsDark();
+    ImGui_ImplAndroid_Init(nullptr);
+
+    ImGui_ImplVulkan_InitInfo init_info = {};
+    init_info.Instance = g_Instance;
+    init_info.PhysicalDevice = g_PhysicalDevice;
+    init_info.Device = g_Device;
+    init_info.QueueFamily = findGraphicsQueueFamily();
+    init_info.Queue = g_Queue;
+    init_info.DescriptorPool = g_DescriptorPool;
+    init_info.MinImageCount = g_MinImageCount;
+    init_info.ImageCount = (uint32_t)g_Framebuffers.size();
+    init_info.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+    init_info.RenderPass = g_RenderPass;
+
+    if (!ImGui_ImplVulkan_Init(&init_info)) return false;
+    return uploadFonts();
+}
+#if DEBUG_MENU
+void DebugMenu() {
+    static int counter;
+    ImGui::SetNextWindowSize(ImVec2(400, 400), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("DEBUG MENU")) {
+        ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
+        ImGui::Text("Screen: %dx%d", g_ScreenExtent.width, g_ScreenExtent.height);
+        ImGui::Text("Idx: %u ; Ctx: %u", g_ImageIndex, g_CurrentContextIndex);
+        ImGui::Text("FB Ptr: %p", (void*)g_Framebuffers[g_ImageIndex]);
+        ImGui::Text("FBs: %lu", g_Framebuffers.size());
+        ImGui::Text("Click count: %d", counter);
+        if(ImGui::Button("CLICK"))
+            counter += 1;
+    }
+    ImGui::End();
+}
+#endif
+/* --- Hooks --- */
+VkResult vkCreateFramebufferReplace(VkDevice device, const VkFramebufferCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkFramebuffer* pFramebuffer) {
+    LOG_CALL("vkCreateFramebufferReplace");
+    VkResult res = vkCreateFramebufferOrigin(device, pCreateInfo, pAllocator, pFramebuffer);
+    if (res == VK_SUCCESS) {
+        LOGD("FBLOG: checking: %dx%d", pCreateInfo->width, pCreateInfo->height);
+        /* in portait mode WIDTH = 1080, in landscape HEIGHT = 1080 */
+        if (pCreateInfo->height >= 1080) {
+            std::lock_guard<std::mutex> lock(g_StateMutex);
+            g_Framebuffers.push_back(*pFramebuffer);
+            g_ScreenExtent.width = pCreateInfo->width;
+            g_ScreenExtent.height = pCreateInfo->height;
+            LOGD("FBLOG: pushed %dx%d", pCreateInfo->width, pCreateInfo->height);
+        }
+    }
+    return res;
+}
+
+void vkDestroyFramebufferReplace(VkDevice device, VkFramebuffer framebuffer, const VkAllocationCallbacks* pAllocator) {
+    LOG_CALL("vkDestroyFramebufferReplace");
     {
-        VkAttachmentDescription attachment = { };
-        attachment.format = VK_FORMAT_B8G8R8A8_UNORM;
-        attachment.samples = VK_SAMPLE_COUNT_1_BIT;
-        attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        attachment.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        attachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        std::lock_guard<std::mutex> lock(g_StateMutex);
 
-        VkAttachmentReference color_attachment = { };
-        color_attachment.attachment = 0;
-        color_attachment.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
-        VkSubpassDescription subpass = { };
-        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-        subpass.colorAttachmentCount = 1;
-        subpass.pColorAttachments = &color_attachment;
-
-        VkRenderPassCreateInfo info = { };
-        info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-        info.attachmentCount = 1;
-        info.pAttachments = &attachment;
-        info.subpassCount = 1;
-        info.pSubpasses = &subpass;
-
-        if(vkCreateRenderPass(device, &info, g_Allocator, &g_RenderPass) != VK_SUCCESS)
-            LOG("[+] Vulkan: Could not create Dear ImGui's render pass");
-    }
-
-    // Create The Image Views
-    {
-        VkImageViewCreateInfo info = { };
-        info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        info.format = VK_FORMAT_B8G8R8A8_UNORM;
-
-        info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        info.subresourceRange.baseMipLevel = 0;
-        info.subresourceRange.levelCount = 1;
-        info.subresourceRange.baseArrayLayer = 0;
-        info.subresourceRange.layerCount = 1;
-
-        for (uint32_t i = 0; i < uImageCount; ++i) {
-            ImGui_ImplVulkanH_Frame* fd = &g_Frames[i];
-            info.image = fd->Backbuffer;
-
-            vkCreateImageView(device, &info, g_Allocator, &fd->BackbufferView);
-        }
-    }
-
-    // Create Framebuffer
-    {
-        VkImageView attachment[1];
-        VkFramebufferCreateInfo info = { };
-        info.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-        info.renderPass = g_RenderPass;
-        info.attachmentCount = 1;
-        info.pAttachments = attachment;
-        info.layers = 1;
-
-        for (uint32_t i = 0; i < uImageCount; ++i) {
-            ImGui_ImplVulkanH_Frame* fd = &g_Frames[i];
-            attachment[0] = fd->BackbufferView;
-
-            vkCreateFramebuffer(device, &info, g_Allocator, &fd->Framebuffer);
-        }
-    }
-
-    if (!g_DescriptorPool) // Create Descriptor Pool.
-    {
-        constexpr VkDescriptorPoolSize pool_sizes[] =
-            {
-                {VK_DESCRIPTOR_TYPE_SAMPLER, 1000},
-                {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1000},
-                {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1000},
-                {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1000},
-                {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1000},
-                {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1000},
-                {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1000},
-                {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1000},
-                {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1000},
-                {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1000},
-                {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1000}};
-
-        VkDescriptorPoolCreateInfo pool_info = { };
-        pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-        pool_info.maxSets = 1000 * IM_ARRAYSIZE(pool_sizes);
-        pool_info.poolSizeCount = (uint32_t)IM_ARRAYSIZE(pool_sizes);
-        pool_info.pPoolSizes = pool_sizes;
-
-        vkCreateDescriptorPool(device, &pool_info, g_Allocator, &g_DescriptorPool);
-    }
-}
-
-static std::add_pointer_t<VkResult VKAPI_CALL(VkDevice, VkSwapchainKHR, uint64_t, VkSemaphore, VkFence, uint32_t*)> oAcquireNextImageKHR;
-static VkResult VKAPI_CALL hkAcquireNextImageKHR(VkDevice device,
-                                                 VkSwapchainKHR swapchain,
-                                                 uint64_t timeout,
-                                                 VkSemaphore semaphore,
-                                                 VkFence fence,
-                                                 uint32_t* pImageIndex) {
-    g_Device = device;
-
-    return oAcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, pImageIndex);
-}
-
-static std::add_pointer_t<VkResult VKAPI_CALL(VkDevice, const VkAcquireNextImageInfoKHR*, uint32_t*)> oAcquireNextImage2KHR;
-static VkResult VKAPI_CALL hkAcquireNextImage2KHR(VkDevice device,
-                                                  const VkAcquireNextImageInfoKHR* pAcquireInfo,
-                                                  uint32_t* pImageIndex) {
-    g_Device = device;
-
-    return oAcquireNextImage2KHR(device, pAcquireInfo, pImageIndex);
-}
-
-static std::add_pointer_t<VkResult VKAPI_CALL(VkQueue, const VkPresentInfoKHR*)> oQueuePresentKHR;
-static VkResult VKAPI_CALL hkQueuePresentKHR(VkQueue queue,
-                                             const VkPresentInfoKHR* pPresentInfo) {
-    RenderImGui_Vulkan(queue, pPresentInfo);
-
-    return oQueuePresentKHR(queue, pPresentInfo);
-}
-
-static std::add_pointer_t<VkResult VKAPI_CALL(VkDevice, const VkSwapchainCreateInfoKHR*, const VkAllocationCallbacks*, VkSwapchainKHR*)> oCreateSwapchainKHR;
-static VkResult VKAPI_CALL hkCreateSwapchainKHR(VkDevice device,
-                                                const VkSwapchainCreateInfoKHR* pCreateInfo,
-                                                const VkAllocationCallbacks* pAllocator,
-                                                VkSwapchainKHR* pSwapchain) {
-    CleanupRenderTarget( );
-    g_ImageExtent = pCreateInfo->imageExtent;
-
-    return oCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
-}
-
-namespace VK {
-    void Hook() {
-        if (!CreateDeviceVK()) {
-            LOG("[!] CreateDeviceVK() failed.\n");
-            return;
-        }
-
-        void* fnAcquireNextImageKHR  = reinterpret_cast<void*>(vkGetDeviceProcAddr(g_FakeDevice, "vkAcquireNextImageKHR"));
-        void* fnAcquireNextImage2KHR = reinterpret_cast<void*>(vkGetDeviceProcAddr(g_FakeDevice, "vkAcquireNextImage2KHR"));
-        void* fnQueuePresentKHR      = reinterpret_cast<void*>(vkGetDeviceProcAddr(g_FakeDevice, "vkQueuePresentKHR"));
-        void* fnCreateSwapchainKHR   = reinterpret_cast<void*>(vkGetDeviceProcAddr(g_FakeDevice, "vkCreateSwapchainKHR"));
-
-        if (g_FakeDevice) {
-            vkDestroyDevice(g_FakeDevice, g_Allocator);
-            g_FakeDevice = NULL;
-        }
-
-        if (fnAcquireNextImageKHR) {
-            // Hook
-            LOG("[+] Vulkan: fnAcquireNextImageKHR: 0x%p\n", fnAcquireNextImageKHR);
-            LOG("[+] Vulkan: fnAcquireNextImage2KHR: 0x%p\n", fnAcquireNextImage2KHR);
-            LOG("[+] Vulkan: fnQueuePresentKHR: 0x%p\n", fnQueuePresentKHR);
-            LOG("[+] Vulkan: fnCreateSwapchainKHR: 0x%p\n", fnCreateSwapchainKHR);
-
-            DobbyHook(reinterpret_cast<void**>(fnAcquireNextImageKHR),  reinterpret_cast<void*>(&hkAcquireNextImageKHR), reinterpret_cast<void**>(&oAcquireNextImageKHR));
-            DobbyHook(reinterpret_cast<void**>(fnAcquireNextImage2KHR), reinterpret_cast<void*>(&hkAcquireNextImage2KHR), reinterpret_cast<void**>(&oAcquireNextImage2KHR));
-            DobbyHook(reinterpret_cast<void**>(fnQueuePresentKHR),      reinterpret_cast<void*>(&hkQueuePresentKHR),     reinterpret_cast<void**>(&oQueuePresentKHR));
-            DobbyHook(reinterpret_cast<void**>(fnCreateSwapchainKHR),   reinterpret_cast<void*>(&hkCreateSwapchainKHR),  reinterpret_cast<void**>(&oCreateSwapchainKHR));
-        }
-    }
-
-    void Unhook( ) {
-        if (ImGui::GetCurrentContext()) {
-            if (ImGui::GetIO().BackendRendererUserData)
-                ImGui_ImplVulkan_Shutdown();
-
-            /*if (ImGui::GetIO().BackendPlatformUserData)
-                ImGui_ImplWin32_Shutdown();*/
-
-            ImGui::DestroyContext();
-        }
-
-        CleanupDeviceVulkan();
-    }
-} // namespace VK
-
-static void CleanupRenderTarget( ) {
-    for (uint32_t i = 0; i < RTL_NUMBER_OF(g_Frames); ++i) {
-        if (g_Frames[i].Fence) {
-            vkDestroyFence(g_Device, g_Frames[i].Fence, g_Allocator);
-            g_Frames[i].Fence = VK_NULL_HANDLE;
-        }
-        if (g_Frames[i].CommandBuffer) {
-            vkFreeCommandBuffers(g_Device, g_Frames[i].CommandPool, 1, &g_Frames[i].CommandBuffer);
-            g_Frames[i].CommandBuffer = VK_NULL_HANDLE;
-        }
-        if (g_Frames[i].CommandPool) {
-            vkDestroyCommandPool(g_Device, g_Frames[i].CommandPool, g_Allocator);
-            g_Frames[i].CommandPool = VK_NULL_HANDLE;
-        }
-        if (g_Frames[i].BackbufferView) {
-            vkDestroyImageView(g_Device, g_Frames[i].BackbufferView, g_Allocator);
-            g_Frames[i].BackbufferView = VK_NULL_HANDLE;
-        }
-        if (g_Frames[i].Framebuffer) {
-            vkDestroyFramebuffer(g_Device, g_Frames[i].Framebuffer, g_Allocator);
-            g_Frames[i].Framebuffer = VK_NULL_HANDLE;
-        }
-    }
-
-    for (uint32_t i = 0; i < RTL_NUMBER_OF(g_FrameSemaphores); ++i) {
-        if (g_FrameSemaphores[i].ImageAcquiredSemaphore) {
-            vkDestroySemaphore(g_Device, g_FrameSemaphores[i].ImageAcquiredSemaphore, g_Allocator);
-            g_FrameSemaphores[i].ImageAcquiredSemaphore = VK_NULL_HANDLE;
-        }
-        if (g_FrameSemaphores[i].RenderCompleteSemaphore) {
-            vkDestroySemaphore(g_Device, g_FrameSemaphores[i].RenderCompleteSemaphore, g_Allocator);
-            g_FrameSemaphores[i].RenderCompleteSemaphore = VK_NULL_HANDLE;
-        }
-    }
-}
-
-static void CleanupDeviceVulkan( ) {
-    CleanupRenderTarget( );
-
-    if (g_DescriptorPool) {
-        vkDestroyDescriptorPool(g_Device, g_DescriptorPool, g_Allocator);
-        g_DescriptorPool = NULL;
-    }
-    if (g_Instance) {
-        vkDestroyInstance(g_Instance, g_Allocator);
-        g_Instance = NULL;
-    }
-
-    g_ImageExtent = { };
-    g_Device = NULL;
-}
-
-static void RenderImGui_Vulkan(VkQueue queue, const VkPresentInfoKHR* pPresentInfo) {
-    if (!g_Device/* || H::bShuttingDown*/)
-        return;
-
-    VkQueue graphicQueue = VK_NULL_HANDLE;
-    const bool queueSupportsGraphic = DoesQueueSupportGraphic(queue, &graphicQueue);
-
-    //Menu::InitializeContext(g_Hwnd);
-    Menu::InitializeContext();
-
-    for (uint32_t i = 0; i < pPresentInfo->swapchainCount; ++i) {
-        VkSwapchainKHR swapchain = pPresentInfo->pSwapchains[i];
-        if (g_Frames[0].Framebuffer == VK_NULL_HANDLE) {
-            CreateRenderTarget(g_Device, swapchain);
-        }
-
-        ImGui_ImplVulkanH_Frame* fd = &g_Frames[pPresentInfo->pImageIndices[i]];
-        ImGui_ImplVulkanH_FrameSemaphores* fsd = &g_FrameSemaphores[pPresentInfo->pImageIndices[i]];
-        {
-            vkWaitForFences(g_Device, 1, &fd->Fence, VK_TRUE, ~0ull);
-            vkResetFences(g_Device, 1, &fd->Fence);
-        }
-        {
-            vkResetCommandBuffer(fd->CommandBuffer, 0);
-
-            VkCommandBufferBeginInfo info = { };
-            info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-            info.flags |= VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-            vkBeginCommandBuffer(fd->CommandBuffer, &info);
-        }
-        {
-            VkRenderPassBeginInfo info = { };
-            info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-            info.renderPass = g_RenderPass;
-            info.framebuffer = fd->Framebuffer;
-            if (g_ImageExtent.width == 0 || g_ImageExtent.height == 0) {
-                // We don't know the window size the first time. So we just set it to 4K.
-                info.renderArea.extent.width = 2400;
-                info.renderArea.extent.height = 1080;
+        for (auto it = g_Framebuffers.begin(); it != g_Framebuffers.end();) {
+            if (*it == framebuffer) {
+                it = g_Framebuffers.erase(it);
+                LOGD("FBLOG: Removed Framebuffer %p via Destroy. Size: %zu", framebuffer, g_Framebuffers.size());
             } else {
-                info.renderArea.extent = g_ImageExtent;
+                ++it;
             }
-
-            vkCmdBeginRenderPass(fd->CommandBuffer, &info, VK_SUBPASS_CONTENTS_INLINE);
         }
+    }
 
-        if (!ImGui::GetIO( ).BackendRendererUserData) {
-            ImGui_ImplVulkan_InitInfo init_info = { };
-            init_info.Instance = g_Instance;
-            init_info.PhysicalDevice = g_PhysicalDevice;
-            init_info.Device = g_Device;
-            init_info.QueueFamily = g_QueueFamily;
-            init_info.Queue = graphicQueue;
-            init_info.PipelineCache = g_PipelineCache;
-            init_info.DescriptorPool = g_DescriptorPool;
-            init_info.Subpass = 0;
-            init_info.MinImageCount = g_MinImageCount;
-            init_info.ImageCount = g_MinImageCount;
-            init_info.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
-            init_info.Allocator = g_Allocator;
-            //ImGui_ImplVulkan_Init(&init_info, g_RenderPass);
-            
-            init_info.RenderPass = g_RenderPass;
-            
-            ImGui_ImplVulkan_Init(&init_info);
+    vkDestroyFramebufferOrigin(device, framebuffer, pAllocator);
+}
 
-            //ImGui_ImplVulkan_CreateFontsTexture(fd->CommandBuffer);
-            ImGui_ImplVulkan_CreateFontsTexture();
-            
-            LOG("[+] Vulkan: setup done");
+VkResult vkAcquireNextImageKHRReplace(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout, VkSemaphore semaphore, VkFence fence, uint32_t* pImageIndex) {
+    LOG_CALL("vkAcquireNextImageKHRReplace");
+    VkResult res = vkAcquireNextImageKHROrigin(device, swapchain, timeout, semaphore, fence, pImageIndex);
+    if (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR) {
+        std::lock_guard<std::mutex> lock(g_StateMutex);
+        g_ImageIndex = *pImageIndex;
+        g_ImGuiNewFrame = true;
+        LOGD("SYNC: Acquire Index %d", g_ImageIndex);
+    }
+    return res;
+}
+
+VkResult vkCreateRenderPass2KHRReplace(VkDevice device, const VkRenderPassCreateInfo2 *pCreateInfo, const VkAllocationCallbacks *pAllocator, VkRenderPass *pRenderPass) {
+    LOG_CALL("vkCreateRenderPass2KHRReplace");
+    VkResult res = vkCreateRenderPass2KHROrigin(device, pCreateInfo, pAllocator, pRenderPass);
+
+    /* Save first RenderPass with required size */
+    if (res == VK_SUCCESS && g_RenderPass == VK_NULL_HANDLE &&
+        pCreateInfo->attachmentCount > 0) {
+        g_RenderPass = *pRenderPass;
+        g_SurfaceFormat = pCreateInfo->pAttachments[0].format;
+        LOGD("RNDPS: Captured RenderPass: %p, format=%d", g_RenderPass, g_SurfaceFormat);
+    }
+    return res;
+}
+
+/* --- Render Hook --- */
+VkResult vkQueueSubmitReplace(VkQueue queue, uint32_t submitCount, const VkSubmitInfo* pSubmits, VkFence fence) {
+    /* Render game */
+    VkResult gameResult = vkQueueSubmitOrigin(queue, submitCount, pSubmits, fence);
+    if (g_InSubmit) return gameResult;
+
+    if (!g_ImGuiInitialized && !g_InitInProgress) {
+        if (g_Device && g_Queue && g_CommandPool && g_Framebuffers.size() >= g_MinImageCount && g_ScreenExtent.width > 0) {
+            g_InitInProgress = true;
+            if (initializeImGui()) {
+                initRenderContexts();
+                g_ImGuiInitialized = true;
+                LOGD("RENDER: ImGui Initialized. FBs: %zu", g_Framebuffers.size());
+            } else {
+                LOGE("RENDER: Init failed.");
+            }
+            g_InitInProgress = false;
         }
-        //LOG("[+] Vulkan: frame");
+    }
+
+    bool shouldRender = false;
+    {
+        std::lock_guard<std::mutex> lock(g_StateMutex);
+        if (g_ImGuiNewFrame && g_ImGuiInitialized && !g_Framebuffers.empty() ) {
+            shouldRender = true;
+            g_ImGuiNewFrame = false;
+        }
+    }
+
+    /* Render ImGui */
+    if (shouldRender) {
+        g_InSubmit = true;
+#if DEBUG_LOG
+        g_FrameCounter++;
+        bool debugFrame = (g_FrameCounter % 60 == 0);
+#endif
+        /* synchronize queues? */
+        //vkQueueWaitIdle(queue);
+
+        RenderContext& ctx = g_RenderContexts[g_CurrentContextIndex];
+        vkWaitForFences(g_Device, 1, &ctx.fence, VK_TRUE, UINT64_MAX);
+        vkResetFences(g_Device, 1, &ctx.fence);
+        vkResetCommandBuffer(ctx.commandBuffer, 0);
+
+        VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr};
+        vkBeginCommandBuffer(ctx.commandBuffer, &bi);
+
         ImGui_ImplVulkan_NewFrame();
-        ImGui_ImplAndroid_NewFrame(SCREEN_WIDTH, SCREEN_HEIGHT);
+        ImGui_ImplAndroid_NewFrame(g_ScreenExtent.width, g_ScreenExtent.height);
         ImGui::NewFrame();
 
         Menu::Render();
+#if DEBUG_MENU
+        DebugMenu();
+#endif
 
         ImGui::Render();
-
-        // Record dear imgui primitives into command buffer
-        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData( ), fd->CommandBuffer);
-
-        // Submit command buffer
-        vkCmdEndRenderPass(fd->CommandBuffer);
-        vkEndCommandBuffer(fd->CommandBuffer);
-
-        uint32_t waitSemaphoresCount = i == 0 ? pPresentInfo->waitSemaphoreCount : 0;
-        if (waitSemaphoresCount == 0 && !queueSupportsGraphic) {
-            constexpr VkPipelineStageFlags stages_wait = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-            {
-                VkSubmitInfo info = { };
-                info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-
-                info.pWaitDstStageMask = &stages_wait;
-
-                info.signalSemaphoreCount = 1;
-                info.pSignalSemaphores = &fsd->RenderCompleteSemaphore;
-
-                vkQueueSubmit(queue, 1, &info, VK_NULL_HANDLE);
-            }
-            {
-                VkSubmitInfo info = { };
-                info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-                info.commandBufferCount = 1;
-                info.pCommandBuffers = &fd->CommandBuffer;
-
-                info.pWaitDstStageMask = &stages_wait;
-                info.waitSemaphoreCount = 1;
-                info.pWaitSemaphores = &fsd->RenderCompleteSemaphore;
-
-                info.signalSemaphoreCount = 1;
-                info.pSignalSemaphores = &fsd->ImageAcquiredSemaphore;
-
-                vkQueueSubmit(graphicQueue, 1, &info, fd->Fence);
-            }
-        } else {
-            std::vector<VkPipelineStageFlags> stages_wait(waitSemaphoresCount, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-
-            VkSubmitInfo info = { };
-            info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-            info.commandBufferCount = 1;
-            info.pCommandBuffers = &fd->CommandBuffer;
-
-            info.pWaitDstStageMask = stages_wait.data( );
-            info.waitSemaphoreCount = waitSemaphoresCount;
-            info.pWaitSemaphores = pPresentInfo->pWaitSemaphores;
-
-            info.signalSemaphoreCount = 1;
-            info.pSignalSemaphores = &fsd->ImageAcquiredSemaphore;
-
-            vkQueueSubmit(graphicQueue, 1, &info, fd->Fence);
+        ImDrawData* draw_data = ImGui::GetDrawData();
+#if DEBUG_LOG
+        if (debugFrame)
+             LOGD("RENDER: Render Info -> CmdLists: %d, TotalVtx: %d, FBs: %zu, FB_Index: %d, Screen: %dx%d",
+                  draw_data->CmdListsCount, draw_data->TotalVtxCount, g_Framebuffers.size(), g_ImageIndex, g_ScreenExtent.width, g_ScreenExtent.height);
+#endif
+        uint32_t idx = g_ImageIndex;
+        if (idx >= g_Framebuffers.size()) {
+          idx = 0;
+          LOGE("RENDER: reseting ImgIdx %d -> 0", g_ImageIndex);
         }
-    }
-}
 
-static bool DoesQueueSupportGraphic(VkQueue queue, VkQueue* pGraphicQueue) {
-    for (uint32_t i = 0; i < g_QueueFamilies.size( ); ++i) {
-        const VkQueueFamilyProperties& family = g_QueueFamilies[i];
-        for (uint32_t j = 0; j < family.queueCount; ++j) {
-            VkQueue it = VK_NULL_HANDLE;
-            vkGetDeviceQueue(g_Device, i, j, &it);
+        VkRenderPassBeginInfo rpInfo = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        rpInfo.renderPass = g_RenderPass;
+        rpInfo.framebuffer = g_Framebuffers[idx];
+        rpInfo.renderArea.extent = g_ScreenExtent;
 
-            if (pGraphicQueue && family.queueFlags & VK_QUEUE_GRAPHICS_BIT) {
-                if (*pGraphicQueue == VK_NULL_HANDLE) {
-                    *pGraphicQueue = it;
-                }
-            }
+        vkCmdBeginRenderPass(ctx.commandBuffer, &rpInfo, VK_SUBPASS_CONTENTS_INLINE);
+        ImGui_ImplVulkan_RenderDrawData(draw_data, ctx.commandBuffer);
+        vkCmdEndRenderPass(ctx.commandBuffer);
 
-            if (queue == it && family.queueFlags & VK_QUEUE_GRAPHICS_BIT) {
-                return true;
-            }
-        }
+        vkEndCommandBuffer(ctx.commandBuffer);
+
+        VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &ctx.commandBuffer;
+
+        VkResult imguiRes = vkQueueSubmitOrigin(queue, 1, &si, ctx.fence);
+        if (imguiRes != VK_SUCCESS)
+            LOGE("RENDER: ImGui QueueSubmit Failed: %d", imguiRes);
+
+        g_CurrentContextIndex = (g_CurrentContextIndex + 1) % 3;
+        g_InSubmit = false;
+        g_ImGuiNewFrame = false;
     }
 
-    return false;
+    return gameResult;
 }
-/*
+
+/* -- Capture Device and Instance -- */
+VkResult vkCreateDeviceReplace(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkDevice* pDevice) {
+    LOG_CALL("vkCreateDeviceReplace");
+    VkResult result = vkCreateDeviceOrigin(physicalDevice, pCreateInfo, pAllocator, pDevice);
+    if (result == VK_SUCCESS) {
+        g_PhysicalDevice = physicalDevice;
+        g_Device = *pDevice;
+        uint32_t qFam = findGraphicsQueueFamily();
+        ((PFN_vkGetDeviceQueue)vkGetDeviceProcAddrOrigin(g_Device, "vkGetDeviceQueue"))(g_Device, qFam, 0, &g_Queue);
+        VkCommandPoolCreateInfo poolInfo = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, nullptr, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, qFam};
+        ((PFN_vkCreateCommandPool)vkGetDeviceProcAddrOrigin(g_Device, "vkCreateCommandPool"))(g_Device, &poolInfo, nullptr, &g_CommandPool);
+        LOGD("CRTDV: Device captured: Queue Family: %d", qFam);
+    }
+    return result;
+}
+
+VkResult vkCreateInstanceReplace(const VkInstanceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkInstance* pInstance) {
+    LOG_CALL("vkCreateInstanceReplace");
+    VkResult result = vkCreateInstanceOrigin(pCreateInfo, pAllocator, pInstance);
+    if (result == VK_SUCCESS) {
+        g_Instance = *pInstance;
+        LOGD("CRTIN: Instance captured: %p", g_Instance);
+    }
+    return result;
+}
+
+
+PFN_vkVoidFunction vkGetDeviceProcAddrReplace(VkDevice device, const char* pName) {
+    PFN_vkVoidFunction addr = vkGetDeviceProcAddrOrigin(device, pName);
+    if (!addr) return nullptr;
+
+    if (strcmp(pName, "vkQueueSubmit") == 0) {
+        LOG_HOOK("GTDEV: %s", pName);
+        vkQueueSubmitOrigin = (PFN_vkQueueSubmit)addr;
+        return (PFN_vkVoidFunction)vkQueueSubmitReplace;
+    }
+    if (strcmp(pName, "vkCreateFramebuffer") == 0) {
+        LOG_HOOK("GTDEV: %s", pName);
+        vkCreateFramebufferOrigin = (PFN_vkCreateFramebuffer)addr;
+        return (PFN_vkVoidFunction)vkCreateFramebufferReplace;
+    }
+    if (strcmp(pName, "vkDestroyFramebuffer") == 0) {
+        LOG_HOOK("GTDEV: %s", pName);
+        vkDestroyFramebufferOrigin = (PFN_vkDestroyFramebuffer)addr;
+        return (PFN_vkVoidFunction)vkDestroyFramebufferReplace;
+    }
+    if (strcmp(pName, "vkCreateRenderPass2KHR") == 0) {
+        LOG_HOOK("GTDEV: %s", pName);
+        vkCreateRenderPass2KHROrigin = (PFN_vkCreateRenderPass2KHR)addr;
+        return (PFN_vkVoidFunction)vkCreateRenderPass2KHRReplace;
+    }
+    return addr;
+}
+
+PFN_vkVoidFunction vkGetInstanceProcAddrReplace(VkInstance instance, const char* pName) {
+    PFN_vkVoidFunction addr = vkGetInstanceProcAddrOrigin(instance, pName);
+    if (!addr) return nullptr;
+    if (instance) g_Instance = instance;
+
+    if (strcmp(pName, "vkCreateInstance") == 0) {
+        LOG_HOOK("GTINS: %s", pName);
+        vkCreateInstanceOrigin = (PFN_vkCreateInstance)addr;
+        return (PFN_vkVoidFunction)vkCreateInstanceReplace;
+    }
+    if (strcmp(pName, "vkCreateDevice") == 0) {
+        LOG_HOOK("GTINS: %s", pName);
+        vkCreateDeviceOrigin = (PFN_vkCreateDevice)addr;
+        return (PFN_vkVoidFunction)vkCreateDeviceReplace;
+    }
+    if (strcmp(pName, "vkGetDeviceProcAddr") == 0) {
+        LOG_HOOK("GTINS: %s", pName);
+        vkGetDeviceProcAddrOrigin = (PFN_vkGetDeviceProcAddr)addr;
+        return (PFN_vkVoidFunction)vkGetDeviceProcAddrReplace;
+    }
+    if (strcmp(pName, "vkAcquireNextImageKHR") == 0) {
+        LOG_HOOK("GTINS: %s", pName);
+        vkAcquireNextImageKHROrigin = (PFN_vkAcquireNextImageKHR)addr;
+        return (PFN_vkVoidFunction)vkAcquireNextImageKHRReplace;
+    }
+    return addr;
+}
+
+void* (*dlsym_)(void* handle, const char* symbol);
+void* dlsym_hook(void* handle, const char* symbol) {
+    void *addr = dlsym_(handle, symbol);
+    if (!addr) return addr;
+
+    if (symbol && strcmp(symbol, "vkGetInstanceProcAddr") == 0) {
+        LOG_HOOK("DLSYM: %s", symbol);
+        if(!vkGetInstanceProcAddrOrigin)
+            vkGetInstanceProcAddrOrigin = (PFN_vkGetInstanceProcAddr)addr;
+        return (void*)vkGetInstanceProcAddrReplace;
+    }
+    return addr;
+}
+
 namespace VK {
     void Hook() {
-        CreateDeviceVK();
+        void* hndl = xdl_open("libdl.so", XDL_TRY_FORCE_LOAD);
+        if (DobbyHook(xdl_sym(hndl, "dlsym", nullptr), (void*)dlsym_hook, (void**)&dlsym_) != 0)
+            LOGE("HOOK: FAIL dlsym hook failed");
     }
-}*/
+}
+
